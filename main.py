@@ -26,6 +26,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Struttura: { (chat_id, "NomeTopic"): thread_id }
 TOPIC_CACHE = {}
 
+CREATE_TOPICS = False # Flag to manage topic creation
+
 def extract_thumbnail(video_path, thumb_path):
     """Estrae un frame al 5° secondo."""
     cap = cv2.VideoCapture(video_path)
@@ -101,7 +103,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name_without_ext = os.path.splitext(full_file_name)[0]
     
     # --- LOGICA DI SEPARAZIONE (Split su "_") ---
-    if "_" in name_without_ext:
+    if "_" in name_without_ext and CREATE_TOPICS:
         # Divide solo alla prima occorrenza. Es: "Vacanze_Video_1" -> prefix="Vacanze", real_name="Video_1"
         prefix, real_name = name_without_ext.split("_", 1)
         clean_caption = real_name.strip()
