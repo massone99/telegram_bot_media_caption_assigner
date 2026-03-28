@@ -1,9 +1,8 @@
 import os
 import logging
-import tempfile
-import cv2
+from io import BytesIO
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -26,27 +25,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Struttura: { (chat_id, "NomeTopic"): thread_id }
 TOPIC_CACHE = {}
 
-CREATE_TOPICS = False # Flag to manage topic creation
-
-def extract_thumbnail(video_path, thumb_path):
-    """Estrae un frame al 5° secondo."""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return False
-    
-    cap.set(cv2.CAP_PROP_POS_MSEC, 5000)
-    success, frame = cap.read()
-    
-    if not success:
-        cap.set(cv2.CAP_PROP_POS_MSEC, 0)
-        success, frame = cap.read()
-
-    if success:
-        # Qualità JPEG 75 per stare leggeri
-        cv2.imwrite(thumb_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-    
-    cap.release()
-    return success
+CREATE_TOPICS = True  # Flag to manage topic creation
+DELIMITER = "##"  # Delimiter to split topic name from file name
 
 async def get_target_thread_id(bot, chat_id, topic_name):
     """
@@ -78,7 +58,7 @@ async def get_target_thread_id(bot, chat_id, topic_name):
         # ritorna None per usare il thread corrente come fallback
         return None
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     bot = context.bot
     chat_id = msg.chat_id
@@ -87,25 +67,44 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.from_user and msg.from_user.id == bot.id:
         return
 
-    # 2. Identifica Video o Documento
-    video_obj = msg.video or msg.document
+    # 2. Identifica Video, Audio, Documento o Foto
+    media_obj = msg.video or msg.audio or msg.document or (msg.photo[-1] if msg.photo else None)
     
-    if not video_obj:
+    if not media_obj:
         return
 
-    if msg.document:
+    media_kind = "document"
+    if msg.video:
+        media_kind = "video"
+    elif msg.photo:
+        media_kind = "photo"
+    elif msg.audio:
+        media_kind = "audio"
+    elif msg.document:
         mime = getattr(msg.document, "mime_type", "")
-        if not mime or not mime.startswith("video/"):
-            return 
+        if mime and mime.startswith("video/"):
+            media_kind = "video"
 
     # 3. Prepara il nome file e Logica Routing
-    full_file_name = getattr(video_obj, "file_name", None) or "Video_User"
+    full_file_name = getattr(media_obj, "file_name", None) or (
+        (msg.caption.strip() if msg.caption and msg.caption.strip() else None)
+        if media_kind == "photo"
+        else None
+    ) or (
+        "Video_User"
+        if media_kind == "video"
+        else ("Photo_User" if media_kind == "photo" else None)
+    ) or (
+        "Photo_User"
+        if media_kind == "photo"
+        else ("Audio_User" if media_kind == "audio" else "File_User")
+    )
     name_without_ext = os.path.splitext(full_file_name)[0]
     
-    # --- LOGICA DI SEPARAZIONE (Split su "_") ---
-    if "_" in name_without_ext and CREATE_TOPICS:
-        # Divide solo alla prima occorrenza. Es: "Vacanze_Video_1" -> prefix="Vacanze", real_name="Video_1"
-        prefix, real_name = name_without_ext.split("_", 1)
+    # --- LOGICA DI SEPARAZIONE (Split su DELIMITER) ---
+    if DELIMITER in name_without_ext and CREATE_TOPICS:
+        # Divide solo alla prima occorrenza. Es: "Vacanze##Video_1" -> prefix="Vacanze", real_name="Video_1"
+        prefix, real_name = name_without_ext.split(DELIMITER, 1)
         clean_caption = real_name.strip()
         topic_name = prefix.strip()
     else:
@@ -114,44 +113,68 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_caption = name_without_ext
     
     logging.info(f"File: {full_file_name} -> Topic Target: {topic_name} | Caption: {clean_caption}")
+    logging.info(f"Chat type: {msg.chat.type} | is_forum: {msg.chat.is_forum} | thread_id: {msg.message_thread_id}")
 
     # Determina dove mandare il file
     target_thread_id = msg.message_thread_id # Default: dove siamo ora
     
-    # Se siamo in un gruppo Forum (Topic abilitati) e abbiamo trovato un prefisso
-    if msg.chat.is_forum and topic_name:
+    # Se siamo in un gruppo (supergroup) e abbiamo trovato un prefisso per il topic
+    is_forum = msg.chat.is_forum or (msg.chat.type == "supergroup")
+    if is_forum and topic_name:
         found_id = await get_target_thread_id(bot, chat_id, topic_name)
         if found_id:
             target_thread_id = found_id
         else:
             logging.warning("Fallback sul topic corrente (Creazione fallita o errore).")
 
-    # 4. Processa il video
+    # 4. Processa il media
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path = os.path.join(temp_dir, "temp_video.mp4")
-            thumb_path = os.path.join(temp_dir, "thumb.jpg")
+        if media_kind == "video":
+            await bot.send_video(
+                chat_id=chat_id,
+                video=media_obj.file_id,
+                caption=clean_caption, # Mettiamo solo il nome pulito
+                supports_streaming=True,
+                message_thread_id=target_thread_id, # <--- Qui avviene la magia del routing
+            )
+        elif media_kind == "photo":
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=media_obj.file_id,
+                caption=clean_caption,
+                message_thread_id=target_thread_id,
+            )
+        elif media_kind in ("audio", "document"):
+            # Per audio/documento rifacciamo upload con nome file pulito,
+            # altrimenti Telegram mantiene il nome originale legato al file_id.
+            _, ext = os.path.splitext(full_file_name)
+            clean_file_name = f"{clean_caption}{ext}" if ext else clean_caption
 
-            # Scarica
-            new_file = await bot.get_file(video_obj.file_id)
-            await new_file.download_to_drive(video_path)
+            telegram_file = await bot.get_file(media_obj.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+            payload = InputFile(BytesIO(file_bytes), filename=clean_file_name)
 
-            # Thumbnail
-            has_thumb = extract_thumbnail(video_path, thumb_path)
-            thumb_arg = open(thumb_path, 'rb') if has_thumb else None
-            
-            try:
-                await bot.send_video(
+            if media_kind == "audio":
+                await bot.send_audio(
                     chat_id=chat_id,
-                    video=video_obj.file_id, 
-                    caption=clean_caption, # Mettiamo solo il nome pulito
-                    thumbnail=thumb_arg,
-                    supports_streaming=True,
-                    message_thread_id=target_thread_id, # <--- Qui avviene la magia del routing
+                    audio=payload,
+                    caption=clean_caption,
+                    message_thread_id=target_thread_id,
                 )
-            finally:
-                if thumb_arg:
-                    thumb_arg.close()
+            else:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=payload,
+                    caption=clean_caption,
+                    message_thread_id=target_thread_id,
+                )
+        else:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=media_obj.file_id,
+                caption=clean_caption,
+                message_thread_id=target_thread_id,
+            )
 
     except Exception as e:
         logging.error(f"Errore download/send: {e}")
@@ -181,10 +204,13 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    media_filter = (filters.VIDEO | filters.Document.ALL)
-    app.add_handler(MessageHandler(media_filter, handle_video))
+    media_filter = (filters.VIDEO | filters.AUDIO | filters.PHOTO | filters.Document.ALL)
+    app.add_handler(MessageHandler(media_filter, handle_media))
 
-    print("Bot avviato con gestione Topic...")
+    if CREATE_TOPICS:
+        print("Bot avviato con gestione Topic attiva (creazione automatica).")
+    else:
+        print("Bot avviato senza gestione Topic (tutti i video rimarranno nel topic corrente).")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
