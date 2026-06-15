@@ -404,6 +404,7 @@ class RenamerApp(ctk.CTk):
 
     def _build_plan(self, root_dir: str):
         plan = []
+        skipped = []
         top_folders = self._get_top_folders(root_dir)
         use_parent_folder = self.use_parent_folder_var.get()
 
@@ -411,6 +412,11 @@ class RenamerApp(ctk.CTk):
             top_path = os.path.join(root_dir, top_folder)
             for dirpath, _, filenames in os.walk(top_path):
                 for fname in filenames:
+                    name_without_ext, _ = os.path.splitext(fname)
+                    if DELIMITER in name_without_ext:
+                        skipped.append((os.path.join(dirpath, fname), "already prefixed"))
+                        continue
+
                     old_path = os.path.join(dirpath, fname)
                     prefix_folder = os.path.basename(dirpath) if use_parent_folder else top_folder
                     new_name = f"{prefix_folder}{DELIMITER}{fname}"
@@ -427,7 +433,7 @@ class RenamerApp(ctk.CTk):
 
                     plan.append((old_path, new_path))
 
-        return plan, top_folders
+        return plan, top_folders, skipped
 
     def _validate_dir(self) -> Optional[str]:
         root_dir = self.dir_var.get().strip()
@@ -460,7 +466,7 @@ class RenamerApp(ctk.CTk):
         self._log_clear()
         self.progress.set(0)
 
-        plan, top_folders = self._build_plan(root_dir)
+        plan, top_folders, skipped = self._build_plan(root_dir)
 
         self.lbl_folders.configure(text=f"Folders: {len(top_folders)}")
         self.lbl_files.configure(text=f"Files: {len(plan)}")
@@ -476,6 +482,12 @@ class RenamerApp(ctk.CTk):
             rel = os.path.relpath(old, root_dir)
             self._log(f"  {rel}  →  {os.path.basename(new)}")
 
+        if skipped:
+            self._log("\nSkipped:")
+            for old, reason in skipped:
+                rel = os.path.relpath(old, root_dir)
+                self._log(f"  {rel}  ({reason})")
+
         if not plan:
             self._log("⚠  No files found inside sub-folders.")
         else:
@@ -488,7 +500,7 @@ class RenamerApp(ctk.CTk):
         if not root_dir:
             return
 
-        plan, top_folders = self._build_plan(root_dir)
+        plan, top_folders, skipped = self._build_plan(root_dir)
 
         if not plan:
             messagebox.showinfo("Nothing to do", "No files found to rename.")
@@ -508,6 +520,13 @@ class RenamerApp(ctk.CTk):
             self._log_clear()
             self._log("🚀  Renaming…\n")
             total = len(plan)
+
+            if skipped:
+                self._log("Skipped:")
+                for old, reason in skipped:
+                    rel = os.path.relpath(old, root_dir)
+                    self._log(f"  -  {rel}  ({reason})")
+                self._log("")
 
             for idx, (old, new) in enumerate(plan, 1):
                 shutil.move(old, new)
