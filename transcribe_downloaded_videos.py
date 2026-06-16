@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import ctypes
 import json
+import os
 import sys
+import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 INPUT_DEFAULT = "downloads"
 MODEL_DEFAULT = "medium"
 LANGUAGE_DEFAULT = "en"
+DEVICE_DEFAULT = "cuda"
+COMPUTE_TYPE_DEFAULT = "float16"
+PREFETCH_MODELS_DEFAULT = ("medium", "large-v3")
+WORKERS_DEFAULT = 1
 VIDEO_EXTENSIONS = {
     ".3gp",
     ".aac",
@@ -43,6 +52,35 @@ class TranscriptionFailure:
     error: str
 
 
+@dataclass
+class TranscriptionOptions:
+    model: str = MODEL_DEFAULT
+    language: str = LANGUAGE_DEFAULT
+    device: str = DEVICE_DEFAULT
+    compute_type: str = COMPUTE_TYPE_DEFAULT
+    beam_size: int = 5
+    cpu_threads: int = 0
+    vad_filter: bool = True
+    condition_on_previous_text: bool = False
+    write_json: bool = False
+    force: bool = False
+    workers: int = WORKERS_DEFAULT
+    model_cache_dir: str | None = None
+
+
+@dataclass
+class TranscriptionPlanItem:
+    media_path: Path
+    paths: tuple[Path, Path, Path]
+    outputs: tuple[Path, ...]
+    status: str
+
+
+LogCallback = Callable[[str], None]
+StatusCallback = Callable[[Path, str], None]
+StopCallback = Callable[[], bool]
+
+
 def import_faster_whisper():
     try:
         from faster_whisper import WhisperModel
@@ -51,6 +89,101 @@ def import_faster_whisper():
             "faster-whisper not found. Install it first: python -m pip install faster-whisper"
         ) from exc
     return WhisperModel
+
+
+def import_download_model():
+    try:
+        from faster_whisper.utils import download_model
+    except ImportError as exc:
+        raise SystemExit(
+            "faster-whisper not found. Install it first: python -m pip install faster-whisper"
+        ) from exc
+    return download_model
+
+
+def cuda_device_count() -> int:
+    try:
+        import ctranslate2
+    except ImportError:
+        return 0
+    return ctranslate2.get_cuda_device_count()
+
+
+def cuda_runtime_libraries() -> list[Path]:
+    package_roots = []
+    for raw_path in sys.path:
+        if not raw_path:
+            continue
+        nvidia_root = Path(raw_path) / "nvidia"
+        if nvidia_root.is_dir():
+            package_roots.append(nvidia_root)
+
+    library_names = (
+        "cuda_nvrtc/lib/libnvrtc.so.12",
+        "cublas/lib/libcublas.so.12",
+        "cublas/lib/libcublasLt.so.12",
+        "cudnn/lib/libcudnn.so.9",
+        "cudnn/lib/libcudnn_ops.so.9",
+        "cudnn/lib/libcudnn_cnn.so.9",
+        "cudnn/lib/libcudnn_adv.so.9",
+    )
+
+    libraries: list[Path] = []
+    for root in package_roots:
+        for library_name in library_names:
+            path = root / library_name
+            if path.exists() and path not in libraries:
+                libraries.append(path)
+    return libraries
+
+
+def preload_cuda_runtime(log: LogCallback | None = None) -> None:
+    libraries = cuda_runtime_libraries()
+    if not any(path.name == "libcublas.so.12" for path in libraries):
+        raise SystemExit(
+            "CUDA runtime libraries not found in this venv. Run: "
+            "python -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12"
+        )
+
+    library_dirs = sorted({str(path.parent) for path in libraries})
+    current_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(
+        library_dirs + ([current_library_path] if current_library_path else [])
+    )
+
+    for path in libraries:
+        try:
+            ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            raise SystemExit(f"Could not load CUDA runtime library {path}: {exc}") from exc
+    emit_log(log, f"CUDA runtime libraries loaded: {', '.join(library_dirs)}")
+
+
+def emit_log(log: LogCallback | None, message: str) -> None:
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    if log:
+        log(line)
+        return
+    print(line, flush=True)
+
+
+def download_models(
+    model_names: Iterable[str],
+    model_cache_dir: str | None = None,
+    log: LogCallback | None = None,
+) -> list[Path]:
+    download_model = import_download_model()
+    downloaded: list[Path] = []
+    for model_name in model_names:
+        started = time.monotonic()
+        emit_log(log, f"Downloading model: {model_name}")
+        path = Path(download_model(model_name, cache_dir=model_cache_dir))
+        downloaded.append(path)
+        emit_log(
+            log,
+            f"Model ready: {model_name} -> {path} ({time.monotonic() - started:.1f}s)",
+        )
+    return downloaded
 
 
 def find_media_files(input_dir: Path) -> list[Path]:
@@ -72,7 +205,10 @@ def transcript_paths(media_path: Path, transcript_dir: Path | None, input_root: 
         if input_root.is_file():
             relative = media_path.name
         else:
-            relative = media_path.relative_to(input_root)
+            try:
+                relative = media_path.relative_to(input_root)
+            except ValueError:
+                relative = media_path.name
         base = (transcript_dir / relative).with_suffix("")
         base.parent.mkdir(parents=True, exist_ok=True)
 
@@ -136,8 +272,64 @@ def expected_outputs(paths: tuple[Path, Path, Path], write_json: bool) -> tuple[
     return txt_path, srt_path
 
 
-def transcribe_file(model, media_path: Path, args) -> tuple[list[TranscriptSegment], object]:
+def transcription_options_from_args(args) -> TranscriptionOptions:
+    return TranscriptionOptions(
+        model=args.model,
+        language=args.language,
+        device=args.device,
+        compute_type=args.compute_type,
+        beam_size=args.beam_size,
+        cpu_threads=args.cpu_threads,
+        vad_filter=args.vad_filter,
+        condition_on_previous_text=args.condition_on_previous_text,
+        write_json=args.write_json,
+        force=args.force,
+        workers=args.workers,
+        model_cache_dir=args.model_cache_dir,
+    )
+
+
+def transcribe_plan_for_files(
+    media_files: Iterable[Path],
+    options: TranscriptionOptions,
+    transcript_dir: Path | None = None,
+    input_root: Path | None = None,
+    limit: int = 0,
+) -> list[TranscriptionPlanItem]:
+    selected = [Path(media_path) for media_path in media_files]
+    if limit:
+        selected = selected[:limit]
+    if input_root is None:
+        input_root = selected[0].parent if len(selected) == 1 else Path()
+
+    plan: list[TranscriptionPlanItem] = []
+    for media_path in selected:
+        paths = transcript_paths(media_path, transcript_dir, input_root)
+        outputs = expected_outputs(paths, options.write_json)
+        status = "skip" if should_skip(outputs, options.force) else "pending"
+        plan.append(
+            TranscriptionPlanItem(
+                media_path=media_path,
+                paths=paths,
+                outputs=outputs,
+                status=status,
+            )
+        )
+    return plan
+
+
+def pending_transcriptions(plan: Iterable[TranscriptionPlanItem]) -> list[TranscriptionPlanItem]:
+    return [item for item in plan if item.status == "pending"]
+
+
+def transcribe_file(
+    model,
+    media_path: Path,
+    args,
+    log: LogCallback | None = None,
+) -> tuple[list[TranscriptSegment], object]:
     language = None if args.language.lower() == "auto" else args.language
+    emit_log(log, f"Decoder start: {media_path} language={language or 'auto'}")
     segments_iter, info = model.transcribe(
         str(media_path),
         language=language,
@@ -146,14 +338,24 @@ def transcribe_file(model, media_path: Path, args) -> tuple[list[TranscriptSegme
         vad_filter=args.vad_filter,
         condition_on_previous_text=args.condition_on_previous_text,
     )
-    segments = [
-        TranscriptSegment(
+    segments = []
+    for index, segment in enumerate(segments_iter, start=1):
+        transcript_segment = TranscriptSegment(
             start=float(segment.start),
             end=float(segment.end),
             text=segment.text.strip(),
         )
-        for segment in segments_iter
-    ]
+        segments.append(transcript_segment)
+        if index == 1 or index % 10 == 0:
+            emit_log(
+                log,
+                (
+                    f"Decoded segment {index}: {media_path.name} "
+                    f"{format_timestamp(transcript_segment.start)} -> "
+                    f"{format_timestamp(transcript_segment.end)}"
+                ),
+            )
+    emit_log(log, f"Decoder done: {media_path} segments={len(segments)}")
     return segments, info
 
 
@@ -166,58 +368,210 @@ def print_transcription_failures(failures: list[TranscriptionFailure]) -> None:
 
 
 def transcribe_all(args) -> int:
+    if args.download_models is not None:
+        models = args.download_models or list(PREFETCH_MODELS_DEFAULT)
+        download_models(models, model_cache_dir=args.model_cache_dir)
+        return 0
+
     input_path = Path(args.input)
     transcript_dir = Path(args.transcript_dir) if args.transcript_dir else None
+    options = transcription_options_from_args(args)
     media_files = find_media_files(input_path)
     if not media_files:
         print(f"No media files found in {input_path}", file=sys.stderr)
         return 1
 
-    selected = media_files[: args.limit] if args.limit else media_files
-    outputs_by_file = [
-        (media_path, transcript_paths(media_path, transcript_dir, input_path))
-        for media_path in selected
-    ]
-    pending = [
-        (media_path, paths)
-        for media_path, paths in outputs_by_file
-        if not should_skip(expected_outputs(paths, args.write_json), args.force)
-    ]
-
-    print(f"Found {len(media_files)} media file(s). Pending: {len(pending)}")
-    if args.dry_run:
-        for media_path, paths in outputs_by_file:
-            outputs = expected_outputs(paths, args.write_json)
-            status = "skip" if should_skip(outputs, args.force) else "pending"
-            print(f"{status}: {media_path}")
-        return 0
-
-    if not pending:
-        return 0
-
-    WhisperModel = import_faster_whisper()
-    model = WhisperModel(
-        args.model,
-        device=args.device,
-        compute_type=args.compute_type,
-        cpu_threads=args.cpu_threads,
+    plan = transcribe_plan_for_files(
+        media_files,
+        options=options,
+        transcript_dir=transcript_dir,
+        input_root=input_path,
+        limit=args.limit,
     )
+    pending = pending_transcriptions(plan)
+
+    emit_log(
+        None,
+        (
+            f"Found {len(media_files)} media file(s). Pending: {len(pending)}. "
+            f"Workers: {options.workers}"
+        ),
+    )
+    if args.dry_run:
+        for item in plan:
+            emit_log(None, f"{item.status}: {item.media_path}")
+        return 0
+
+    return transcribe_plan(pending, options)
+
+
+def load_model(options: TranscriptionOptions, log: LogCallback | None = None):
+    WhisperModel = import_faster_whisper()
+    if options.device == "cuda":
+        device_count = cuda_device_count()
+        if device_count < 1:
+            raise SystemExit(
+                "CUDA requested but no NVIDIA GPU is visible. "
+                "Check NVIDIA driver with nvidia-smi, then retry."
+            )
+        emit_log(log, f"CUDA device(s) visible: {device_count}")
+        preload_cuda_runtime(log=log)
+
+    started = time.monotonic()
+    emit_log(
+        log,
+        (
+            f"Loading model: {options.model} device={options.device} "
+            f"compute={options.compute_type} cpu_threads={options.cpu_threads} "
+            f"workers={options.workers}"
+        ),
+    )
+    model = WhisperModel(
+        options.model,
+        device=options.device,
+        compute_type=options.compute_type,
+        cpu_threads=options.cpu_threads,
+        num_workers=max(1, options.workers),
+        download_root=options.model_cache_dir,
+    )
+    emit_log(log, f"Model loaded: {options.model} ({time.monotonic() - started:.1f}s)")
+    return model
+
+
+def transcribe_one_plan_item(
+    model,
+    item: TranscriptionPlanItem,
+    options: TranscriptionOptions,
+    index: int,
+    total: int,
+    log: LogCallback | None = None,
+    status_callback: StatusCallback | None = None,
+) -> TranscriptionFailure | None:
+    media_path = item.media_path
+    txt_path, srt_path, json_path = item.paths
+    if status_callback:
+        status_callback(media_path, "running")
+    emit_log(log, f"[{index}/{total}] Start: {media_path}")
+    emit_log(log, f"Outputs: {', '.join(str(path) for path in item.outputs)}")
+    started = time.monotonic()
+    try:
+        segments, info = transcribe_file(model, media_path, options, log=log)
+        write_txt(txt_path, segments)
+        emit_log(log, f"Wrote TXT: {txt_path}")
+        write_srt(srt_path, segments)
+        emit_log(log, f"Wrote SRT: {srt_path}")
+        if options.write_json:
+            write_json(json_path, media_path, segments, info)
+            emit_log(log, f"Wrote JSON: {json_path}")
+    except Exception as exc:
+        if status_callback:
+            status_callback(media_path, "failed")
+        emit_log(log, f"Failed transcription: {media_path}: {exc}")
+        return TranscriptionFailure(media_path=media_path, error=str(exc))
+
+    if status_callback:
+        status_callback(media_path, "done")
+    emit_log(log, f"[{index}/{total}] Done: {media_path} ({time.monotonic() - started:.1f}s)")
+    return None
+
+
+def transcribe_plan(
+    plan: Iterable[TranscriptionPlanItem],
+    options: TranscriptionOptions,
+    log: LogCallback | None = None,
+    status_callback: StatusCallback | None = None,
+    stop_requested: StopCallback | None = None,
+) -> int:
+    pending = list(plan)
+    if not pending:
+        emit_log(log, "No pending files.")
+        return 0
+
+    model = load_model(options, log=log)
 
     failures: list[TranscriptionFailure] = []
-    for index, (media_path, (txt_path, srt_path, json_path)) in enumerate(pending, start=1):
-        print(f"[{index}/{len(pending)}] {media_path}")
-        try:
-            segments, info = transcribe_file(model, media_path, args)
-            write_txt(txt_path, segments)
-            write_srt(srt_path, segments)
-            if args.write_json:
-                write_json(json_path, media_path, segments, info)
-        except Exception as exc:
-            failure = TranscriptionFailure(media_path=media_path, error=str(exc))
-            failures.append(failure)
-            print(f"Failed transcription: {media_path}: {exc}", file=sys.stderr)
+    total = len(pending)
+    workers = max(1, min(options.workers, total))
+    emit_log(log, f"Transcription queue start: files={total} workers={workers}")
+
+    if workers == 1:
+        for index, item in enumerate(pending, start=1):
+            if stop_requested and stop_requested():
+                emit_log(log, "Stop requested before next file.")
+                break
+            failure = transcribe_one_plan_item(
+                model,
+                item,
+                options,
+                index,
+                total,
+                log=log,
+                status_callback=status_callback,
+            )
+            if failure:
+                failures.append(failure)
+    else:
+        indexed_items = list(enumerate(pending, start=1))
+        next_index = 0
+        futures = {}
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="transcribe") as executor:
+            while next_index < total and len(futures) < workers:
+                index, item = indexed_items[next_index]
+                next_index += 1
+                futures[
+                    executor.submit(
+                        transcribe_one_plan_item,
+                        model,
+                        item,
+                        options,
+                        index,
+                        total,
+                        log,
+                        status_callback,
+                    )
+                ] = item
+
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    item = futures.pop(future)
+                    try:
+                        failure = future.result()
+                    except Exception as exc:
+                        failure = TranscriptionFailure(item.media_path, str(exc))
+                        if status_callback:
+                            status_callback(item.media_path, "failed")
+                        emit_log(log, f"Worker failed: {item.media_path}: {exc}")
+                    if failure:
+                        failures.append(failure)
+
+                while (
+                    next_index < total
+                    and len(futures) < workers
+                    and not (stop_requested and stop_requested())
+                ):
+                    index, item = indexed_items[next_index]
+                    next_index += 1
+                    futures[
+                        executor.submit(
+                            transcribe_one_plan_item,
+                            model,
+                            item,
+                            options,
+                            index,
+                            total,
+                            log,
+                            status_callback,
+                        )
+                    ] = item
+
+                if stop_requested and stop_requested() and next_index < total:
+                    emit_log(log, "Stop requested. Waiting for running file(s) to finish.")
+                    next_index = total
 
     print_transcription_failures(failures)
+    emit_log(log, f"Transcription queue done: failures={len(failures)}")
     return 1 if failures else 0
 
 
@@ -241,15 +595,34 @@ def parse_args() -> argparse.Namespace:
         help=f"faster-whisper model name. Default: {MODEL_DEFAULT}",
     )
     parser.add_argument(
+        "--download-models",
+        nargs="*",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Download model(s) then exit. If no names are passed, downloads: "
+            + ", ".join(PREFETCH_MODELS_DEFAULT)
+        ),
+    )
+    parser.add_argument(
+        "--model-cache-dir",
+        default=None,
+        help="Optional faster-whisper/Hugging Face model cache directory.",
+    )
+    parser.add_argument(
         "--language",
         default=LANGUAGE_DEFAULT,
         help=f"Language code, or 'auto'. Default: {LANGUAGE_DEFAULT}",
     )
-    parser.add_argument("--device", default="auto", help="auto, cuda, cpu. Default: auto")
+    parser.add_argument(
+        "--device",
+        default=DEVICE_DEFAULT,
+        help=f"auto, cuda, cpu. Default: {DEVICE_DEFAULT}",
+    )
     parser.add_argument(
         "--compute-type",
-        default="auto",
-        help="auto, float16, int8_float16, int8, float32. Default: auto",
+        default=COMPUTE_TYPE_DEFAULT,
+        help=f"auto, float16, int8_float16, int8, float32. Default: {COMPUTE_TYPE_DEFAULT}",
     )
     parser.add_argument("--beam-size", type=int, default=5, help="Beam size. Default: 5")
     parser.add_argument(
@@ -257,6 +630,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="CPU threads. 0 lets faster-whisper choose. Default: 0",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=WORKERS_DEFAULT,
+        help=f"Concurrent files to transcribe. Default: {WORKERS_DEFAULT}",
     )
     parser.add_argument(
         "--no-vad-filter",

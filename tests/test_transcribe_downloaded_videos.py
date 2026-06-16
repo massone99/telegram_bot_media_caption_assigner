@@ -66,6 +66,102 @@ class OutputPathTests(unittest.TestCase):
             self.assertTrue((transcript_dir / "HIPS").is_dir())
 
 
+class TranscriptionPlanTests(unittest.TestCase):
+    def test_plan_preserves_explicit_file_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "b.mp4"
+            second = root / "a.mp4"
+            first.write_bytes(b"video")
+            second.write_bytes(b"video")
+
+            plan = transcribe.transcribe_plan_for_files(
+                [first, second],
+                transcribe.TranscriptionOptions(),
+            )
+
+            self.assertEqual([item.media_path for item in plan], [first, second])
+
+    def test_plan_marks_skip_unless_overwrite_is_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "video.mp4"
+            media.write_bytes(b"video")
+            media.with_suffix(".txt").write_text("done", encoding="utf-8")
+            media.with_suffix(".srt").write_text("1\n", encoding="utf-8")
+
+            skipped = transcribe.transcribe_plan_for_files(
+                [media],
+                transcribe.TranscriptionOptions(force=False),
+            )
+            pending = transcribe.transcribe_plan_for_files(
+                [media],
+                transcribe.TranscriptionOptions(force=True),
+            )
+
+            self.assertEqual(skipped[0].status, "skip")
+            self.assertEqual(pending[0].status, "pending")
+
+    def test_plan_json_option_requires_json_output_to_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "video.mp4"
+            media.write_bytes(b"video")
+            media.with_suffix(".txt").write_text("done", encoding="utf-8")
+            media.with_suffix(".srt").write_text("1\n", encoding="utf-8")
+
+            plan = transcribe.transcribe_plan_for_files(
+                [media],
+                transcribe.TranscriptionOptions(write_json=True),
+            )
+
+            self.assertEqual(
+                plan[0].outputs,
+                (
+                    media.with_suffix(".txt"),
+                    media.with_suffix(".srt"),
+                    media.with_suffix(".json"),
+                ),
+            )
+            self.assertEqual(plan[0].status, "pending")
+
+    def test_plan_mirrors_transcript_dir_for_folder_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            downloads = root / "downloads"
+            media = downloads / "HIPS" / "001 - Hip.mp4"
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"video")
+            transcript_dir = root / "transcripts"
+
+            plan = transcribe.transcribe_plan_for_files(
+                [media],
+                transcribe.TranscriptionOptions(),
+                transcript_dir=transcript_dir,
+                input_root=downloads,
+            )
+
+            self.assertEqual(plan[0].paths[0], transcript_dir / "HIPS" / "001 - Hip.txt")
+            self.assertEqual(plan[0].paths[1], transcript_dir / "HIPS" / "001 - Hip.srt")
+
+    def test_plan_handles_arbitrary_multi_file_selection_with_transcript_dir(self):
+        with tempfile.TemporaryDirectory() as left_tmp, tempfile.TemporaryDirectory() as right_tmp:
+            left = Path(left_tmp) / "left.mp4"
+            right = Path(right_tmp) / "right.mp4"
+            left.write_bytes(b"video")
+            right.write_bytes(b"video")
+            transcript_dir = Path(left_tmp) / "transcripts"
+
+            plan = transcribe.transcribe_plan_for_files(
+                [left, right],
+                transcribe.TranscriptionOptions(),
+                transcript_dir=transcript_dir,
+            )
+
+            self.assertEqual(plan[0].paths[0], transcript_dir / "left.txt")
+            self.assertEqual(plan[1].paths[0], transcript_dir / "right.txt")
+
+
 class FormattingTests(unittest.TestCase):
     def test_format_timestamp_uses_srt_format(self):
         self.assertEqual(transcribe.format_timestamp(3723.4567), "01:02:03,457")
