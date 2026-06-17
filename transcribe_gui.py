@@ -136,6 +136,7 @@ class TranscribeGui(QMainWindow):
         self.vad_check.setChecked(True)
         self.previous_text_check = QCheckBox("Previous text")
         self.json_check = QCheckBox("JSON")
+        self.json_check.setChecked(True)
         self.overwrite_check = QCheckBox("Overwrite")
 
         controls = [
