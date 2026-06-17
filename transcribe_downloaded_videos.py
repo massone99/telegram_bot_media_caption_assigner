@@ -213,10 +213,14 @@ def transcript_paths(media_path: Path, transcript_dir: Path | None, input_root: 
         base.parent.mkdir(parents=True, exist_ok=True)
 
     return (
-        base.with_suffix(".txt"),
-        base.with_suffix(".srt"),
-        base.with_suffix(".json"),
+        transcript_output_path(base, ".txt"),
+        transcript_output_path(base, ".srt"),
+        transcript_output_path(base, ".json"),
     )
+
+
+def transcript_output_path(base: Path, suffix: str) -> Path:
+    return base.with_name(f"{base.name}{suffix}")
 
 
 def format_timestamp(seconds: float) -> str:

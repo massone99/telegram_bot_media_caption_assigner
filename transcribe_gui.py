@@ -101,6 +101,7 @@ class TranscribeGui(QMainWindow):
         source_layout = QGridLayout(source_group)
         self.folder_edit = QLineEdit(str(ROOT / "downloads"))
         self.transcript_dir_edit = QLineEdit()
+        self.model_cache_dir_edit = QLineEdit()
         source_layout.addWidget(QLabel("Folder"), 0, 0)
         source_layout.addWidget(self.folder_edit, 0, 1)
         self.scan_button = QPushButton("Scan Folder")
@@ -110,7 +111,7 @@ class TranscribeGui(QMainWindow):
         self.folder_button.clicked.connect(self.pick_folder)
         source_layout.addWidget(self.folder_button, 0, 3)
 
-        source_layout.addWidget(QLabel("Transcript Dir"), 1, 0)
+        source_layout.addWidget(QLabel("Output Dir"), 1, 0)
         source_layout.addWidget(self.transcript_dir_edit, 1, 1)
         self.transcript_dir_button = QPushButton("Browse")
         self.transcript_dir_button.clicked.connect(self.pick_transcript_dir)
@@ -118,6 +119,12 @@ class TranscribeGui(QMainWindow):
         self.add_files_button = QPushButton("Add Files")
         self.add_files_button.clicked.connect(self.add_files)
         source_layout.addWidget(self.add_files_button, 1, 3)
+
+        source_layout.addWidget(QLabel("Model Cache Dir"), 2, 0)
+        source_layout.addWidget(self.model_cache_dir_edit, 2, 1)
+        self.model_cache_dir_button = QPushButton("Browse")
+        self.model_cache_dir_button.clicked.connect(self.pick_model_cache_dir)
+        source_layout.addWidget(self.model_cache_dir_button, 2, 2)
         layout.addWidget(source_group)
 
         options_group = QGroupBox("Options")
@@ -232,12 +239,22 @@ class TranscribeGui(QMainWindow):
     def pick_transcript_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Choose transcript folder",
-            self.transcript_dir_edit.text() or self.settings.value("lastTranscriptFolder", str(ROOT)),
+            "Choose output folder",
+            self.transcript_dir_edit.text() or self.settings.value("lastOutputFolder", str(ROOT)),
         )
         if folder:
             self.transcript_dir_edit.setText(folder)
-            self.settings.setValue("lastTranscriptFolder", folder)
+            self.settings.setValue("lastOutputFolder", folder)
+
+    def pick_model_cache_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose model cache folder",
+            self.model_cache_dir_edit.text() or self.settings.value("lastModelCacheFolder", str(ROOT)),
+        )
+        if folder:
+            self.model_cache_dir_edit.setText(folder)
+            self.settings.setValue("lastModelCacheFolder", folder)
 
     def scan_folder(self) -> None:
         folder = Path(self.folder_edit.text()).expanduser()
@@ -317,6 +334,7 @@ class TranscribeGui(QMainWindow):
             condition_on_previous_text=self.previous_text_check.isChecked(),
             write_json=self.json_check.isChecked(),
             force=self.overwrite_check.isChecked(),
+            model_cache_dir=self.model_cache_dir_edit.text().strip() or None,
         )
 
     def transcript_dir(self) -> Path | None:
@@ -430,6 +448,7 @@ class TranscribeGui(QMainWindow):
             self.scan_button,
             self.folder_button,
             self.transcript_dir_button,
+            self.model_cache_dir_button,
             self.add_files_button,
             self.preview_button,
             self.transcribe_selected_button,
@@ -444,7 +463,10 @@ class TranscribeGui(QMainWindow):
 
     def _restore_settings(self) -> None:
         self.folder_edit.setText(self.settings.value("folder", str(ROOT / "downloads")))
-        self.transcript_dir_edit.setText(self.settings.value("transcriptDir", ""))
+        self.transcript_dir_edit.setText(
+            self.settings.value("outputDir", self.settings.value("transcriptDir", ""))
+        )
+        self.model_cache_dir_edit.setText(self.settings.value("modelCacheDir", ""))
         self.model_combo.setCurrentText(self.settings.value("model", "medium"))
         self.language_edit.setText(self.settings.value("language", "en"))
         self.device_combo.setCurrentText(self.settings.value("device", transcribe.DEVICE_DEFAULT))
@@ -463,6 +485,8 @@ class TranscribeGui(QMainWindow):
     def _save_settings(self) -> None:
         self.settings.setValue("folder", self.folder_edit.text())
         self.settings.setValue("transcriptDir", self.transcript_dir_edit.text())
+        self.settings.setValue("outputDir", self.transcript_dir_edit.text())
+        self.settings.setValue("modelCacheDir", self.model_cache_dir_edit.text())
         self.settings.setValue("model", self.model_combo.currentText())
         self.settings.setValue("language", self.language_edit.text())
         self.settings.setValue("device", self.device_combo.currentText())
@@ -480,6 +504,7 @@ class TranscribeGui(QMainWindow):
         for line_edit in (
             self.folder_edit,
             self.transcript_dir_edit,
+            self.model_cache_dir_edit,
             self.language_edit,
         ):
             line_edit.textChanged.connect(self._save_settings)

@@ -65,6 +65,31 @@ class OutputPathTests(unittest.TestCase):
             self.assertEqual(json_path, transcript_dir / "HIPS" / "001 - Hip.json")
             self.assertTrue((transcript_dir / "HIPS").is_dir())
 
+    def test_transcript_paths_preserve_numbered_titles_with_dots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "downloads" / "1. An Introduction To Kinstretch With Beard.m4v"
+            transcript_dir = root / "transcripts"
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"video")
+
+            txt, srt, json_path = transcribe.transcript_paths(
+                media, transcript_dir, root / "downloads"
+            )
+
+            self.assertEqual(
+                txt,
+                transcript_dir / "1. An Introduction To Kinstretch With Beard.txt",
+            )
+            self.assertEqual(
+                srt,
+                transcript_dir / "1. An Introduction To Kinstretch With Beard.srt",
+            )
+            self.assertEqual(
+                json_path,
+                transcript_dir / "1. An Introduction To Kinstretch With Beard.json",
+            )
+
 
 class TranscriptionPlanTests(unittest.TestCase):
     def test_plan_preserves_explicit_file_order(self):
