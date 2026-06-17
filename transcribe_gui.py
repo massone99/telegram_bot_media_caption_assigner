@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QSettings, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -85,8 +85,11 @@ class TranscribeGui(QMainWindow):
         self.worker: TranscriptionWorker | None = None
         self.worker_exit_code: int | None = None
         self.close_when_worker_finishes = False
+        self.settings = QSettings("bot_rinomina_video", "transcribe_gui")
 
         self._create_widgets()
+        self._restore_settings()
+        self._connect_settings_signals()
         self._set_busy(False)
 
     def _create_widgets(self) -> None:
@@ -216,15 +219,25 @@ class TranscribeGui(QMainWindow):
         return spin
 
     def pick_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose media folder", self.folder_edit.text())
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose media folder",
+            self.folder_edit.text() or self.settings.value("lastMediaFolder", str(ROOT)),
+        )
         if folder:
             self.folder_edit.setText(folder)
+            self.settings.setValue("lastMediaFolder", folder)
             self.scan_folder()
 
     def pick_transcript_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose transcript folder", str(ROOT))
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose transcript folder",
+            self.transcript_dir_edit.text() or self.settings.value("lastTranscriptFolder", str(ROOT)),
+        )
         if folder:
             self.transcript_dir_edit.setText(folder)
+            self.settings.setValue("lastTranscriptFolder", folder)
 
     def scan_folder(self) -> None:
         folder = Path(self.folder_edit.text()).expanduser()
@@ -234,12 +247,18 @@ class TranscribeGui(QMainWindow):
             QMessageBox.warning(self, "Folder scan failed", str(exc))
             return
         self.scan_root = folder
+        self.settings.setValue("lastMediaFolder", str(folder))
         self.files = media_files
         self.render_files()
         self.log_line(f"Scanned {folder}: {len(media_files)} media file(s)")
 
     def add_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add media files", str(ROOT), MEDIA_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add media files",
+            self.settings.value("lastMediaFolder", str(ROOT)),
+            MEDIA_FILTER,
+        )
         if not paths:
             return
         existing = set(self.files)
@@ -248,6 +267,8 @@ class TranscribeGui(QMainWindow):
             if path.suffix.lower() in transcribe.VIDEO_EXTENSIONS and path not in existing:
                 self.files.append(path)
                 existing.add(path)
+        if paths:
+            self.settings.setValue("lastMediaFolder", str(Path(paths[0]).parent))
         self.render_files()
         self.log_line(f"Added {len(paths)} selected file(s)")
 
@@ -421,6 +442,67 @@ class TranscribeGui(QMainWindow):
         self.stop_button.setEnabled(busy)
         self.status_label.setText("Transcribing" if busy else "Ready")
 
+    def _restore_settings(self) -> None:
+        self.folder_edit.setText(self.settings.value("folder", str(ROOT / "downloads")))
+        self.transcript_dir_edit.setText(self.settings.value("transcriptDir", ""))
+        self.model_combo.setCurrentText(self.settings.value("model", "medium"))
+        self.language_edit.setText(self.settings.value("language", "en"))
+        self.device_combo.setCurrentText(self.settings.value("device", transcribe.DEVICE_DEFAULT))
+        self.compute_combo.setCurrentText(self.settings.value("computeType", transcribe.COMPUTE_TYPE_DEFAULT))
+        self.beam_spin.setValue(int(self.settings.value("beamSize", 5)))
+        self.cpu_threads_spin.setValue(int(self.settings.value("cpuThreads", 0)))
+        self.workers_spin.setValue(int(self.settings.value("workers", transcribe.WORKERS_DEFAULT)))
+        self.vad_check.setChecked(self.settings.value("vadFilter", "true") == "true")
+        self.previous_text_check.setChecked(self.settings.value("previousText", "false") == "true")
+        self.json_check.setChecked(self.settings.value("writeJson", "true") == "true")
+        self.overwrite_check.setChecked(self.settings.value("force", "false") == "true")
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("folder", self.folder_edit.text())
+        self.settings.setValue("transcriptDir", self.transcript_dir_edit.text())
+        self.settings.setValue("model", self.model_combo.currentText())
+        self.settings.setValue("language", self.language_edit.text())
+        self.settings.setValue("device", self.device_combo.currentText())
+        self.settings.setValue("computeType", self.compute_combo.currentText())
+        self.settings.setValue("beamSize", self.beam_spin.value())
+        self.settings.setValue("cpuThreads", self.cpu_threads_spin.value())
+        self.settings.setValue("workers", self.workers_spin.value())
+        self.settings.setValue("vadFilter", "true" if self.vad_check.isChecked() else "false")
+        self.settings.setValue("previousText", "true" if self.previous_text_check.isChecked() else "false")
+        self.settings.setValue("writeJson", "true" if self.json_check.isChecked() else "false")
+        self.settings.setValue("force", "true" if self.overwrite_check.isChecked() else "false")
+        self.settings.setValue("geometry", self.saveGeometry())
+
+    def _connect_settings_signals(self) -> None:
+        for line_edit in (
+            self.folder_edit,
+            self.transcript_dir_edit,
+            self.language_edit,
+        ):
+            line_edit.textChanged.connect(self._save_settings)
+        for combo in (
+            self.model_combo,
+            self.device_combo,
+            self.compute_combo,
+        ):
+            combo.currentTextChanged.connect(self._save_settings)
+        for spin in (
+            self.beam_spin,
+            self.cpu_threads_spin,
+            self.workers_spin,
+        ):
+            spin.valueChanged.connect(self._save_settings)
+        for checkbox in (
+            self.vad_check,
+            self.previous_text_check,
+            self.json_check,
+            self.overwrite_check,
+        ):
+            checkbox.toggled.connect(self._save_settings)
+
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
             answer = QMessageBox.question(
@@ -435,6 +517,7 @@ class TranscribeGui(QMainWindow):
             self.close_when_worker_finishes = True
             event.ignore()
             return
+        self._save_settings()
         event.accept()
 
 

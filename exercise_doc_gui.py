@@ -3,7 +3,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QSettings, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,9 +37,12 @@ class ExerciseDocOptions:
     output_dir: Path
     media_root: Path | None
     screenshots_per_block: int
+    seconds_per_screenshot: int
+    max_screenshots_per_block: int
     extract_images: bool
     overwrite_images: bool
     write_docx: bool
+    write_pdf: bool
     split_on_pauses: bool
     pause_seconds: int
     ffmpeg_bin: str
@@ -111,8 +114,11 @@ class ExerciseDocGui(QMainWindow):
         self.worker: ExerciseDocWorker | None = None
         self.worker_exit_code: int | None = None
         self.close_when_worker_finishes = False
+        self.settings = QSettings("bot_rinomina_video", "exercise_doc_gui")
 
         self._create_widgets()
+        self._restore_settings()
+        self._connect_settings_signals()
         self._set_busy(False)
 
     def _create_widgets(self) -> None:
@@ -152,18 +158,23 @@ class ExerciseDocGui(QMainWindow):
 
         options_group = QGroupBox("Options")
         options_layout = QGridLayout(options_group)
-        self.screenshots_spin = self._spin(1, 12, 3)
+        self.screenshots_spin = self._spin(0, 99, 0)
+        self.seconds_per_screenshot_spin = self._spin(5, 600, 45)
+        self.max_screenshots_spin = self._spin(0, 999, 12)
         self.pause_spin = self._spin(1, 120, 12)
         self.ffmpeg_edit = QLineEdit("ffmpeg")
         self.extract_check = QCheckBox("Extract")
         self.extract_check.setChecked(True)
         self.docx_check = QCheckBox("DOCX")
+        self.pdf_check = QCheckBox("PDF")
         self.split_check = QCheckBox("Split pauses")
         self.overwrite_images_check = QCheckBox("Overwrite images")
         self.overwrite_check = QCheckBox("Overwrite")
 
         controls = [
-            ("Screenshots", self.screenshots_spin),
+            ("Fixed Shots", self.screenshots_spin),
+            ("Seconds/Image", self.seconds_per_screenshot_spin),
+            ("Max Shots", self.max_screenshots_spin),
             ("Pause Seconds", self.pause_spin),
             ("FFmpeg", self.ffmpeg_edit),
         ]
@@ -172,9 +183,10 @@ class ExerciseDocGui(QMainWindow):
             options_layout.addWidget(widget, 1, column)
         options_layout.addWidget(self.extract_check, 2, 0)
         options_layout.addWidget(self.docx_check, 2, 1)
-        options_layout.addWidget(self.split_check, 2, 2)
-        options_layout.addWidget(self.overwrite_images_check, 2, 3)
-        options_layout.addWidget(self.overwrite_check, 2, 4)
+        options_layout.addWidget(self.pdf_check, 2, 2)
+        options_layout.addWidget(self.split_check, 2, 3)
+        options_layout.addWidget(self.overwrite_images_check, 2, 4)
+        options_layout.addWidget(self.overwrite_check, 2, 5)
         layout.addWidget(options_group)
 
         table_actions = QHBoxLayout()
@@ -229,20 +241,35 @@ class ExerciseDocGui(QMainWindow):
         return spin
 
     def pick_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose transcript folder", self.folder_edit.text())
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose transcript folder",
+            self.folder_edit.text() or self.settings.value("lastTranscriptFolder", str(ROOT)),
+        )
         if folder:
             self.folder_edit.setText(folder)
+            self.settings.setValue("lastTranscriptFolder", folder)
             self.scan_folder()
 
     def pick_output_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", str(ROOT))
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose output folder",
+            self.output_dir_edit.text() or self.settings.value("lastOutputFolder", str(ROOT)),
+        )
         if folder:
             self.output_dir_edit.setText(folder)
+            self.settings.setValue("lastOutputFolder", folder)
 
     def pick_media_root(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose media folder", str(ROOT))
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose media folder",
+            self.media_root_edit.text() or self.settings.value("lastMediaFolder", str(ROOT)),
+        )
         if folder:
             self.media_root_edit.setText(folder)
+            self.settings.setValue("lastMediaFolder", folder)
 
     def scan_folder(self) -> None:
         folder = Path(self.folder_edit.text()).expanduser()
@@ -252,12 +279,18 @@ class ExerciseDocGui(QMainWindow):
             QMessageBox.warning(self, "Folder scan failed", str(exc))
             return
         self.scan_root = folder
+        self.settings.setValue("lastTranscriptFolder", str(folder))
         self.files = transcript_files
         self.render_files()
         self.log_line(f"Scanned {folder}: {len(transcript_files)} transcript file(s)")
 
     def add_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add transcript files", str(ROOT), TRANSCRIPT_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add transcript files",
+            self.settings.value("lastTranscriptFolder", str(ROOT)),
+            TRANSCRIPT_FILTER,
+        )
         if not paths:
             return
         existing = set(self.files)
@@ -266,6 +299,8 @@ class ExerciseDocGui(QMainWindow):
             if path.suffix.lower() == ".json" and path not in existing:
                 self.files.append(path)
                 existing.add(path)
+        if paths:
+            self.settings.setValue("lastTranscriptFolder", str(Path(paths[0]).parent))
         self.render_files()
         self.log_line(f"Added {len(paths)} selected file(s)")
 
@@ -307,9 +342,12 @@ class ExerciseDocGui(QMainWindow):
             output_dir=Path(self.output_dir_edit.text()).expanduser(),
             media_root=Path(media_root_raw).expanduser() if media_root_raw else None,
             screenshots_per_block=self.screenshots_spin.value(),
+            seconds_per_screenshot=self.seconds_per_screenshot_spin.value(),
+            max_screenshots_per_block=self.max_screenshots_spin.value(),
             extract_images=self.extract_check.isChecked(),
             overwrite_images=self.overwrite_images_check.isChecked(),
             write_docx=self.docx_check.isChecked(),
+            write_pdf=self.pdf_check.isChecked(),
             split_on_pauses=self.split_check.isChecked(),
             pause_seconds=self.pause_spin.value(),
             ffmpeg_bin=self.ffmpeg_edit.text().strip() or "ffmpeg",
@@ -419,6 +457,67 @@ class ExerciseDocGui(QMainWindow):
         self.stop_button.setEnabled(busy)
         self.status_label.setText("Building" if busy else "Ready")
 
+    def _restore_settings(self) -> None:
+        self.folder_edit.setText(self.settings.value("folder", str(ROOT / "downloads")))
+        self.output_dir_edit.setText(self.settings.value("outputDir", str(ROOT / "exercise_docs")))
+        self.media_root_edit.setText(self.settings.value("mediaRoot", ""))
+        self.ffmpeg_edit.setText(self.settings.value("ffmpegBin", "ffmpeg"))
+        self.screenshots_spin.setValue(int(self.settings.value("screenshotsPerBlock", 0)))
+        self.seconds_per_screenshot_spin.setValue(int(self.settings.value("secondsPerScreenshot", 45)))
+        self.max_screenshots_spin.setValue(int(self.settings.value("maxScreenshotsPerBlock", 12)))
+        self.pause_spin.setValue(int(self.settings.value("pauseSeconds", 12)))
+        self.extract_check.setChecked(self.settings.value("extractImages", "true") == "true")
+        self.docx_check.setChecked(self.settings.value("writeDocx", "false") == "true")
+        self.pdf_check.setChecked(self.settings.value("writePdf", "false") == "true")
+        self.split_check.setChecked(self.settings.value("splitOnPauses", "false") == "true")
+        self.overwrite_images_check.setChecked(self.settings.value("overwriteImages", "false") == "true")
+        self.overwrite_check.setChecked(self.settings.value("force", "false") == "true")
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("folder", self.folder_edit.text())
+        self.settings.setValue("outputDir", self.output_dir_edit.text())
+        self.settings.setValue("mediaRoot", self.media_root_edit.text())
+        self.settings.setValue("ffmpegBin", self.ffmpeg_edit.text())
+        self.settings.setValue("screenshotsPerBlock", self.screenshots_spin.value())
+        self.settings.setValue("secondsPerScreenshot", self.seconds_per_screenshot_spin.value())
+        self.settings.setValue("maxScreenshotsPerBlock", self.max_screenshots_spin.value())
+        self.settings.setValue("pauseSeconds", self.pause_spin.value())
+        self.settings.setValue("extractImages", "true" if self.extract_check.isChecked() else "false")
+        self.settings.setValue("writeDocx", "true" if self.docx_check.isChecked() else "false")
+        self.settings.setValue("writePdf", "true" if self.pdf_check.isChecked() else "false")
+        self.settings.setValue("splitOnPauses", "true" if self.split_check.isChecked() else "false")
+        self.settings.setValue("overwriteImages", "true" if self.overwrite_images_check.isChecked() else "false")
+        self.settings.setValue("force", "true" if self.overwrite_check.isChecked() else "false")
+        self.settings.setValue("geometry", self.saveGeometry())
+
+    def _connect_settings_signals(self) -> None:
+        for line_edit in (
+            self.folder_edit,
+            self.output_dir_edit,
+            self.media_root_edit,
+            self.ffmpeg_edit,
+        ):
+            line_edit.textChanged.connect(self._save_settings)
+        for spin in (
+            self.screenshots_spin,
+            self.seconds_per_screenshot_spin,
+            self.max_screenshots_spin,
+            self.pause_spin,
+        ):
+            spin.valueChanged.connect(self._save_settings)
+        for checkbox in (
+            self.extract_check,
+            self.docx_check,
+            self.pdf_check,
+            self.split_check,
+            self.overwrite_images_check,
+            self.overwrite_check,
+        ):
+            checkbox.toggled.connect(self._save_settings)
+
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
             answer = QMessageBox.question(
@@ -433,6 +532,7 @@ class ExerciseDocGui(QMainWindow):
             self.close_when_worker_finishes = True
             event.ignore()
             return
+        self._save_settings()
         event.accept()
 
 
@@ -471,10 +571,17 @@ def expected_outputs_for_document(
     ]
     if options.write_docx:
         outputs.append(options.output_dir / f"{slug}.docx")
+    if options.write_pdf:
+        outputs.append(options.output_dir / f"{slug}.pdf")
     if options.extract_images:
         for block_index, block in enumerate(document.blocks, start=1):
             for cue_index, cue in enumerate(
-                docs.screenshot_cues(block, count=options.screenshots_per_block),
+                docs.screenshot_cues(
+                    block,
+                    count=options.screenshots_per_block,
+                    seconds_per_screenshot=options.seconds_per_screenshot,
+                    max_count=options.max_screenshots_per_block,
+                ),
                 start=1,
             ):
                 outputs.append(
@@ -502,7 +609,12 @@ def build_one_document(
     cues_by_block = {}
 
     for block_index, block in enumerate(document.blocks, start=1):
-        cues = docs.screenshot_cues(block, count=options.screenshots_per_block)
+        cues = docs.screenshot_cues(
+            block,
+            count=options.screenshots_per_block,
+            seconds_per_screenshot=options.seconds_per_screenshot,
+            max_count=options.max_screenshots_per_block,
+        )
         cues_by_block[block_index] = cues
         for cue_index, cue in enumerate(cues, start=1):
             image_path = asset_dir / docs.screenshot_filename(block_index, cue_index, cue)
@@ -536,6 +648,10 @@ def build_one_document(
         docx_path = options.output_dir / f"{slug}.docx"
         docs.write_docx_document(docx_path, document, image_paths)
         log(f"Wrote DOCX: {docx_path}")
+    if options.write_pdf:
+        pdf_path = options.output_dir / f"{slug}.pdf"
+        docs.write_pdf_document(pdf_path, document, image_paths)
+        log(f"Wrote PDF: {pdf_path}")
 
 
 def main() -> int:

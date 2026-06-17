@@ -71,6 +71,12 @@ class ScreenshotCue:
 
 
 @dataclass(frozen=True)
+class ScreenshotGroup:
+    cue: ScreenshotCue
+    segments: tuple[TranscriptSegment, ...]
+
+
+@dataclass(frozen=True)
 class TranscriptDocument:
     transcript_path: Path
     media_path: Path | None
@@ -199,9 +205,19 @@ def cue_score(text: str) -> int:
 
 def screenshot_cues(
     block: ExerciseBlock,
-    count: int = 3,
+    count: int = 0,
+    seconds_per_screenshot: int = 45,
+    min_count: int = 1,
+    max_count: int = 12,
     edge_padding_seconds: float = 1.0,
 ) -> tuple[ScreenshotCue, ...]:
+    if count < 1:
+        count = screenshot_count_for_block(
+            block,
+            seconds_per_screenshot=seconds_per_screenshot,
+            min_count=min_count,
+            max_count=max_count,
+        )
     if count < 1:
         return ()
 
@@ -231,6 +247,43 @@ def screenshot_cues(
             break
 
     return tuple(sorted(selected, key=lambda item: item.time))
+
+
+def screenshot_count_for_block(
+    block: ExerciseBlock,
+    seconds_per_screenshot: int = 45,
+    min_count: int = 1,
+    max_count: int = 12,
+) -> int:
+    duration = max(0.0, block.end - block.start)
+    if seconds_per_screenshot < 1:
+        seconds_per_screenshot = 45
+    count = math.ceil(duration / seconds_per_screenshot)
+    if max_count > 0:
+        count = min(max_count, count)
+    return max(min_count, count)
+
+
+def group_segments_by_cue(block: ExerciseBlock, cues: Iterable[ScreenshotCue]) -> tuple[ScreenshotGroup, ...]:
+    ordered_cues = tuple(sorted(cues, key=lambda cue: cue.time))
+    if not ordered_cues:
+        return ()
+    groups = []
+    for index, cue in enumerate(ordered_cues):
+        low = block.start if index == 0 else midpoint(ordered_cues[index - 1].time, cue.time)
+        high = block.end if index == len(ordered_cues) - 1 else midpoint(cue.time, ordered_cues[index + 1].time)
+        segments = tuple(
+            segment
+            for segment in block.segments
+            if segment_intersects_window(segment, low, high)
+        )
+        groups.append(ScreenshotGroup(cue=cue, segments=segments))
+    return tuple(groups)
+
+
+def segment_intersects_window(segment: TranscriptSegment, start: float, end: float) -> bool:
+    segment_midpoint = midpoint(segment.start, segment.end)
+    return start <= segment_midpoint <= end
 
 
 def midpoint(start: float, end: float) -> float:
@@ -287,6 +340,7 @@ def extract_screenshot(
         return
     command = [
         ffmpeg_bin,
+        "-y" if overwrite else "-n",
         "-hide_banner",
         "-loglevel",
         "error",
@@ -347,9 +401,40 @@ def render_markdown(document: TranscriptDocument, image_paths: dict[tuple[int, i
             if image_path is None:
                 break
             lines.extend([f"![Cue {cue_index}]({image_path.as_posix()})", ""])
-        transcript = " ".join(segment.text.strip() for segment in block.segments if segment.text.strip())
-        lines.extend([transcript, ""])
+            cue = image_cue_from_path(block, image_path, cue_index, image_paths, block_index)
+            segments = text_segments_for_image(block, cue_index, image_paths, block_index, cue)
+            text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+            if text:
+                lines.extend([text, ""])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def image_cue_from_path(
+    block: ExerciseBlock,
+    image_path: Path,
+    cue_index: int,
+    image_paths: dict[tuple[int, int], Path],
+    block_index: int,
+) -> ScreenshotCue:
+    cues = screenshot_cues(block, count=len([key for key in image_paths if key[0] == block_index]))
+    if 1 <= cue_index <= len(cues):
+        return cues[cue_index - 1]
+    return ScreenshotCue(time=midpoint(block.start, block.end), reason="fallback", score=0, text=str(image_path))
+
+
+def text_segments_for_image(
+    block: ExerciseBlock,
+    cue_index: int,
+    image_paths: dict[tuple[int, int], Path],
+    block_index: int,
+    cue: ScreenshotCue,
+) -> tuple[TranscriptSegment, ...]:
+    count = len([key for key in image_paths if key[0] == block_index])
+    cues = screenshot_cues(block, count=count) if count else (cue,)
+    groups = group_segments_by_cue(block, cues)
+    if 1 <= cue_index <= len(groups):
+        return groups[cue_index - 1].segments
+    return block.segments
 
 
 def write_markdown_document(path: Path, document: TranscriptDocument, image_paths: dict[tuple[int, int], Path]) -> None:
@@ -379,11 +464,55 @@ def write_docx_document(path: Path, document: TranscriptDocument, image_paths: d
             resolved_image_path = image_path if image_path.exists() else path.parent / image_path
             if resolved_image_path.exists():
                 doc.add_picture(str(resolved_image_path), width=Inches(5.8))
-        transcript = " ".join(segment.text.strip() for segment in block.segments if segment.text.strip())
-        doc.add_paragraph(transcript)
+            cue = image_cue_from_path(block, image_path, cue_index, image_paths, block_index)
+            segments = text_segments_for_image(block, cue_index, image_paths, block_index, cue)
+            transcript = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+            if transcript:
+                doc.add_paragraph(transcript)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(path)
+
+
+def write_pdf_document(path: Path, document: TranscriptDocument, image_paths: dict[tuple[int, int], Path]) -> None:
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+    except ImportError as exc:
+        raise RuntimeError("reportlab not found. Install it: python -m pip install reportlab") from exc
+
+    styles = getSampleStyleSheet()
+    elements = [Paragraph(document.title, styles["Title"]), Spacer(1, 12)]
+    if document.media_path:
+        elements.extend([Paragraph(f"Source: {document.media_path}", styles["BodyText"]), Spacer(1, 8)])
+
+    for block_index, block in enumerate(document.blocks, start=1):
+        elements.extend(
+            [
+                Paragraph(block.title, styles["Heading2"]),
+                Paragraph(
+                    f"Time: {seconds_to_timestamp(block.start)} - {seconds_to_timestamp(block.end)}",
+                    styles["BodyText"],
+                ),
+                Spacer(1, 8),
+            ]
+        )
+        for cue_index in range(1, 100):
+            image_path = image_paths.get((block_index, cue_index))
+            if image_path is None:
+                break
+            resolved_image_path = image_path if image_path.exists() else path.parent / image_path
+            if resolved_image_path.exists():
+                elements.extend([Image(str(resolved_image_path), width=430, height=242), Spacer(1, 8)])
+            cue = image_cue_from_path(block, image_path, cue_index, image_paths, block_index)
+            segments = text_segments_for_image(block, cue_index, image_paths, block_index, cue)
+            transcript = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+            if transcript:
+                elements.extend([Paragraph(transcript, styles["BodyText"]), Spacer(1, 12)])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    SimpleDocTemplate(str(path), pagesize=letter).build(elements)
 
 
 def manifest_for_document(
@@ -405,6 +534,16 @@ def manifest_for_document(
                     {
                         **asdict(cue),
                         "image": str(image_paths.get((block_index, cue_index))),
+                        "text": " ".join(
+                            segment.text.strip()
+                            for segment in group_segments_by_cue(
+                                block,
+                                cues_by_block.get(block_index, ()),
+                            )[cue_index - 1].segments
+                            if segment.text.strip()
+                        )
+                        if cue_index <= len(group_segments_by_cue(block, cues_by_block.get(block_index, ())))
+                        else cue.text,
                     }
                     for cue_index, cue in enumerate(cues_by_block.get(block_index, ()), start=1)
                 ],

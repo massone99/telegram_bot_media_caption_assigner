@@ -36,9 +36,12 @@ class ExerciseDocGuiPlanTests(unittest.TestCase):
                 output_dir=output_dir,
                 media_root=None,
                 screenshots_per_block=1,
+                seconds_per_screenshot=45,
+                max_screenshots_per_block=12,
                 extract_images=False,
                 overwrite_images=False,
                 write_docx=False,
+                write_pdf=False,
                 split_on_pauses=False,
                 pause_seconds=12,
                 ffmpeg_bin="ffmpeg",
@@ -60,10 +63,13 @@ class ExerciseDocGuiPlanTests(unittest.TestCase):
             options = exercise_doc_gui.ExerciseDocOptions(
                 output_dir=root / "docs",
                 media_root=None,
-                screenshots_per_block=2,
+                screenshots_per_block=0,
+                seconds_per_screenshot=2,
+                max_screenshots_per_block=12,
                 extract_images=True,
                 overwrite_images=False,
                 write_docx=True,
+                write_pdf=True,
                 split_on_pauses=False,
                 pause_seconds=12,
                 ffmpeg_bin="ffmpeg",
@@ -74,6 +80,7 @@ class ExerciseDocGuiPlanTests(unittest.TestCase):
             outputs = exercise_doc_gui.expected_outputs_for_document(document, options)
 
         self.assertIn(root / "docs" / "lesson.docx", outputs)
+        self.assertIn(root / "docs" / "lesson.pdf", outputs)
         self.assertTrue(any(path.parent.name == "lesson_assets" for path in outputs))
 
 

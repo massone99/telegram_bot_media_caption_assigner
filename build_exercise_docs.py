@@ -14,6 +14,7 @@ from exercise_doc_core import (
     write_docx_document,
     write_manifest,
     write_markdown_document,
+    write_pdf_document,
 )
 
 
@@ -39,8 +40,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--screenshots-per-block",
         type=int,
-        default=3,
-        help="Screenshot count per exercise block.",
+        default=0,
+        help="Fixed screenshot count per block. Use 0 for automatic duration-based count.",
+    )
+    parser.add_argument(
+        "--seconds-per-screenshot",
+        type=int,
+        default=45,
+        help="Automatic mode ratio: one screenshot every N seconds.",
+    )
+    parser.add_argument(
+        "--max-screenshots-per-block",
+        type=int,
+        default=12,
+        help="Maximum screenshots per block in automatic mode. Use 0 for no limit.",
     )
     parser.add_argument(
         "--extract",
@@ -72,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         "--docx",
         action="store_true",
         help="Also write .docx files. Requires python-docx.",
+    )
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also write .pdf files. Requires reportlab.",
     )
     parser.add_argument(
         "--limit",
@@ -120,7 +138,12 @@ def main() -> int:
             cues_by_block = {}
 
             for block_index, block in enumerate(document.blocks, start=1):
-                cues = screenshot_cues(block, count=args.screenshots_per_block)
+                cues = screenshot_cues(
+                    block,
+                    count=args.screenshots_per_block,
+                    seconds_per_screenshot=args.seconds_per_screenshot,
+                    max_count=args.max_screenshots_per_block,
+                )
                 cues_by_block[block_index] = cues
                 for cue_index, cue in enumerate(cues, start=1):
                     image_path = asset_dir / screenshot_filename(block_index, cue_index, cue)
@@ -152,6 +175,8 @@ def main() -> int:
             )
             if args.docx:
                 write_docx_document(output_dir / f"{slug}.docx", document, image_paths)
+            if args.pdf:
+                write_pdf_document(output_dir / f"{slug}.pdf", document, image_paths)
             print(f"Wrote: {output_dir / f'{slug}.md'}")
         except Exception as exc:
             failures.append(f"{transcript_path}: {exc}")
